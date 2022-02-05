@@ -24,8 +24,20 @@ struct FileRecord<'a> {
     hash: &'a String,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::join!(real_main());
+        });
+}
+
+// #[tokio::main(worker_threads = 4)]
+async fn real_main() {
     env_logger::init();
     info!("Hello, world!");
 
@@ -83,7 +95,7 @@ fn insert_file_record(record: FileRecord) {
 
 async fn walk_filesystem_hashing(root: std::path::PathBuf) {
     info!("Walking {}", root.display());
-    let files = WalkDir::new(root).same_file_system(true);
+    let files = WalkDir::new(root).same_file_system(true).max_open(100);
 
     let mut handles = vec![];
     for file_result in files {
@@ -115,7 +127,7 @@ async fn digest_and_insert_path(file: DirEntry) {
         debug!("Directory found: {}", path.to_str().unwrap());
         return;
     }
-    let digest = calculate_digest(&path, 500 * 1024 * 1024);
+    let digest = calculate_digest(&path, 5 * 1024 * 1024);
     let record = FileRecord {
         filename: &path.file_name().unwrap().to_string_lossy().to_string(),
         filepath: &path.to_string_lossy().to_string(),
