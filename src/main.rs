@@ -1,10 +1,13 @@
+extern crate core;
+
 use clap::Parser;
+use core::panicking::panic;
 use env_logger;
 use log::{debug, error, info};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection};
+use std::io::Read;
 use std::path::PathBuf;
-use tokio::io::AsyncReadExt;
 use walkdir::{DirEntry, WalkDir};
 
 /// Receive a command from command-line, expecting a path from which to start walking the fs tree.
@@ -26,8 +29,8 @@ struct FileRecord<'a> {
 
 fn main() {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .max_blocking_threads(4)
+        .worker_threads(400)
+        .max_blocking_threads(400)
         .enable_all()
         .build()
         .unwrap()
@@ -77,7 +80,7 @@ fn create_tables(conn: &Connection) {
     .unwrap();
 }
 
-fn insert_file_record(record: FileRecord) {
+fn insert_file_record(record: FileRecord, remaining_retries: u8) {
     let conn = Connection::open("filesystem_dupes.db").unwrap();
     match conn.execute(
         "INSERT INTO file_record (filename, filepath, hash) VALUES (?1, ?2, ?3)",
@@ -87,8 +90,14 @@ fn insert_file_record(record: FileRecord) {
             debug!("{} inserted into file_record table", record.filename);
         }
         Err(err) => {
-            let err_msg = format!("Error inserting file_record: {err}");
+            let err_msg =
+                format!("Error inserting file_record: {err}, retrying {remaining_retries} times");
             error!("{}", err_msg);
+            if remaining_retries > 0 {
+                insert_file_record(record, remaining_retries - 1)
+            } else {
+                !panic(format!("Failed to insert {:?} into db", record).as_str())
+            }
         }
     }
 }
@@ -122,22 +131,24 @@ async fn walk_filesystem_hashing(root: std::path::PathBuf) {
 }
 
 async fn digest_and_insert_path(file: DirEntry) {
+    debug!("digest: {:?}", file);
     let path = file.into_path();
     if path.is_dir() {
         debug!("Directory found: {}", path.to_str().unwrap());
         return;
     }
-    let digest = calculate_digest(&path, 5 * 1024 * 1024);
+    let digest = calculate_digest(&path);
     let record = FileRecord {
         filename: &path.file_name().unwrap().to_string_lossy().to_string(),
         filepath: &path.to_string_lossy().to_string(),
         hash: &String::from(digest.await.unwrap()),
     };
-    insert_file_record(record)
+    insert_file_record(record, 200)
 }
 
-async fn calculate_digest(file: &PathBuf, chunk_size: usize) -> Option<String> {
-    let mut f = match tokio::fs::File::open(file).await {
+async fn calculate_digest(file: &PathBuf) -> Option<String> {
+    debug!("Calculate digest: {:?}", file);
+    let mut f = match std::fs::File::open(file) {
         Ok(f) => f,
         Err(open_error) => {
             error!(
@@ -148,15 +159,27 @@ async fn calculate_digest(file: &PathBuf, chunk_size: usize) -> Option<String> {
             return None;
         }
     };
-    let mut md5 = Md5::new();
-    let mut input_buffer = vec![0u8; chunk_size];
 
+    let mut md5 = Md5::new();
+    let chunk_size = 0x4000;
     let md5_result = loop {
-        let amount_read = f.read(&mut input_buffer).await.unwrap();
-        if amount_read > 0 {
-            md5.update(&input_buffer[0..amount_read]);
-        } else {
-            break md5.finalize();
+        let mut chunk = Vec::with_capacity(chunk_size);
+        match f
+            .by_ref()
+            .take(chunk_size as u64)
+            .read_to_end(&mut chunk)
+            .ok()
+        {
+            Some(n) => {
+                if n == 0 {
+                    break md5.finalize();
+                }
+                md5.update(chunk);
+                if n < chunk_size {
+                    break md5.finalize();
+                }
+            }
+            None => break md5.finalize(),
         }
     };
     Some(format!("{:x}", md5_result))
