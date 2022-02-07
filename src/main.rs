@@ -78,10 +78,7 @@ fn create_tables(conn_lock: &Arc<RwLock<Connection>>) {
         .unwrap();
 }
 
-async fn insert_file_record(
-    conn_lock: &Arc<RwLock<Connection>>,
-    record: FileRecord,
-) -> Result<(), &str> {
+fn insert_file_record(conn_lock: &Arc<RwLock<Connection>>, record: FileRecord) -> Result<(), &str> {
     return match conn_lock.write().unwrap().execute(
         "INSERT INTO file_record (filename, filepath, hash) VALUES (?1, ?2, ?3)",
         params![record.filename, record.filepath, record.hash],
@@ -100,7 +97,7 @@ async fn insert_file_record(
 
 async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLock<Connection>>) {
     info!("Walking {}", root.display());
-    let files = WalkDir::new(root).same_file_system(true);
+    let files = WalkDir::new(root).same_file_system(false);
 
     let mut handles = vec![];
     for file_result in files {
@@ -120,27 +117,30 @@ async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLoc
                 continue;
             }
         };
-        info!("pushing future into handles");
-        let future = digest_and_insert_path(file, &conn_lock);
-        handles.push(future);
+        handles.push(digest_file(file));
     }
     info!("Joining {} async handles", handles.len());
-    futures::future::join_all(handles.into_iter()).await;
+    for record in futures::future::join_all(handles.into_iter().map(tokio::spawn)).await {
+        match record {
+            Ok(Some(r)) => insert_file_record(&conn_lock, r).unwrap(),
+            Err(e) => error!("Future returned error: {:?}", e),
+            _ => debug!("Probably a directory"),
+        }
+    }
 }
 
-async fn digest_and_insert_path(file: DirEntry, conn_lock: &Arc<RwLock<Connection>>) {
+async fn digest_file(file: DirEntry) -> Option<FileRecord> {
     debug!("digest: {:?}", file);
     let path = file.into_path();
     if path.is_dir() {
-        return;
+        return None;
     }
     let digest = calculate_digest(&path).await.unwrap();
-    let record = FileRecord {
+    return Some(FileRecord {
         filename: path.file_name().unwrap().to_string_lossy().to_string(),
         filepath: path.to_string_lossy().to_string(),
         hash: digest,
-    };
-    insert_file_record(&conn_lock, record).await.unwrap()
+    });
 }
 
 async fn calculate_digest(file: &PathBuf) -> Option<String> {
