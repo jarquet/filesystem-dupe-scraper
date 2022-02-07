@@ -19,34 +19,20 @@ struct Cli {
 }
 
 #[derive(Debug)]
-struct FileRecord<'a> {
-    filename: &'a String,
-    filepath: &'a String,
-    hash: &'a String,
+struct FileRecord {
+    filename: String,
+    filepath: String,
+    hash: String,
 }
 
-fn main() {
-    let conn = Connection::open("filesystem_dupes.db").unwrap();
-
-    // Move the initial value into the read-write lock which is wrapped into an atomic reference
-    // counter in order to allow safe sharing.
-    let conn_lock = Arc::new(RwLock::new(conn));
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(400)
-        .max_blocking_threads(400)
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            tokio::join!(real_main(conn_lock));
-        });
-}
-
-async fn real_main(conn_lock: Arc<RwLock<Connection>>) {
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+async fn main() {
     env_logger::init();
     info!("Hello, world!");
 
     let args = Cli::parse();
+    let conn = Connection::open("filesystem_dupes.db").unwrap();
+    let conn_lock = Arc::new(RwLock::new(conn));
 
     if args.command == "walk" {
         info!("Walk command received");
@@ -92,29 +78,29 @@ fn create_tables(conn_lock: &Arc<RwLock<Connection>>) {
         .unwrap();
 }
 
-async fn insert_file_record<'a>(
-    conn_lock: &'a Arc<RwLock<Connection>>,
-    record: FileRecord<'_>,
-) -> Result<(), &'a str> {
-    match conn_lock.write().unwrap().execute(
+async fn insert_file_record(
+    conn_lock: &Arc<RwLock<Connection>>,
+    record: FileRecord,
+) -> Result<(), &str> {
+    return match conn_lock.write().unwrap().execute(
         "INSERT INTO file_record (filename, filepath, hash) VALUES (?1, ?2, ?3)",
-        params![*record.filename, *record.filepath, *record.hash],
+        params![record.filename, record.filepath, record.hash],
     ) {
         Ok(_) => {
             debug!("{} inserted into file_record table", record.filename);
-            return Ok(());
+            Ok(())
         }
         Err(err) => {
             let err_msg = format!("Error inserting file_record: {err}");
             warn!("{}", err_msg);
-            return Err("Failed to insert into db");
+            Err("Failed to insert into db")
         }
-    }
+    };
 }
 
 async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLock<Connection>>) {
     info!("Walking {}", root.display());
-    let files = WalkDir::new(root).same_file_system(true).max_open(100);
+    let files = WalkDir::new(root).same_file_system(true);
 
     let mut handles = vec![];
     for file_result in files {
@@ -137,6 +123,7 @@ async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLoc
         };
         handles.push(digest_and_insert_path(file, &conn_lock));
     }
+    info!("Joining {} async handles", handles.len());
     futures::future::join_all(handles).await;
 }
 
@@ -147,11 +134,11 @@ async fn digest_and_insert_path(file: DirEntry, conn_lock: &Arc<RwLock<Connectio
         debug!("Directory found: {}", path.to_str().unwrap());
         return;
     }
-    let digest = calculate_digest(&path);
+    let digest = calculate_digest(&path).await.unwrap();
     let record = FileRecord {
-        filename: &path.file_name().unwrap().to_string_lossy().to_string(),
-        filepath: &path.to_string_lossy().to_string(),
-        hash: &String::from(digest.await.unwrap()),
+        filename: path.file_name().unwrap().to_string_lossy().to_string(),
+        filepath: path.to_string_lossy().to_string(),
+        hash: digest,
     };
     insert_file_record(&conn_lock, record).await.unwrap()
 }
