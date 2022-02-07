@@ -25,7 +25,7 @@ struct FileRecord {
     hash: String,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() {
     env_logger::init();
     info!("Hello, world!");
@@ -79,6 +79,7 @@ fn create_tables(conn_lock: &Arc<RwLock<Connection>>) {
 }
 
 fn insert_file_record(conn_lock: &Arc<RwLock<Connection>>, record: FileRecord) -> Result<(), &str> {
+    info!("Inserting {:?} into db", record);
     return match conn_lock.write().unwrap().execute(
         "INSERT INTO file_record (filename, filepath, hash) VALUES (?1, ?2, ?3)",
         params![record.filename, record.filepath, record.hash],
@@ -158,7 +159,7 @@ async fn calculate_digest(file: &PathBuf) -> Option<String> {
     };
 
     let mut md5 = Md5::new();
-    let chunk_size = 0x4000;
+    let chunk_size = 100 * 1024 * 1024;
     let md5_result = loop {
         let mut chunk = Vec::with_capacity(chunk_size);
         match f
