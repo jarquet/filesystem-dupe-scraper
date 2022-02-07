@@ -1,13 +1,11 @@
-extern crate core;
-
 use clap::Parser;
-use core::panicking::panic;
 use env_logger;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use walkdir::{DirEntry, WalkDir};
 
 /// Receive a command from command-line, expecting a path from which to start walking the fs tree.
@@ -28,6 +26,11 @@ struct FileRecord<'a> {
 }
 
 fn main() {
+    let conn = Connection::open("filesystem_dupes.db").unwrap();
+
+    // Move the initial value into the read-write lock which is wrapped into an atomic reference
+    // counter in order to allow safe sharing.
+    let conn_lock = Arc::new(RwLock::new(conn));
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(400)
         .max_blocking_threads(400)
@@ -35,24 +38,30 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async {
-            tokio::join!(real_main());
+            tokio::join!(real_main(conn_lock));
         });
 }
 
-// #[tokio::main(worker_threads = 4)]
-async fn real_main() {
+async fn real_main(conn_lock: Arc<RwLock<Connection>>) {
     env_logger::init();
     info!("Hello, world!");
 
     let args = Cli::parse();
-    let conn = Connection::open("filesystem_dupes.db").unwrap();
 
     if args.command == "walk" {
         info!("Walk command received");
-        create_tables(&conn);
-        walk_filesystem_hashing(args.path.expect("'walk' command expects a path arg")).await;
-        let count = match conn.query_row("Select count(*) from file_record;", [], |row| row.get(0))
-        {
+        create_tables(&conn_lock);
+
+        walk_filesystem_hashing(
+            args.path.expect("'walk' command expects a path arg"),
+            &conn_lock,
+        )
+        .await;
+        let count = match conn_lock.read().unwrap().query_row(
+            "Select count(*) from file_record;",
+            [],
+            |row| row.get(0),
+        ) {
             Ok(count) => count,
             Err(sql_error) => {
                 error!("sql error msg: {}", sql_error);
@@ -63,46 +72,47 @@ async fn real_main() {
         return;
     }
     if args.command == "setup" {
-        create_tables(&conn);
+        create_tables(&conn_lock);
     }
 }
 
-fn create_tables(conn: &Connection) {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS file_record (
+fn create_tables(conn_lock: &Arc<RwLock<Connection>>) {
+    conn_lock
+        .write()
+        .unwrap()
+        .execute(
+            "CREATE TABLE IF NOT EXISTS file_record (
                   id            INTEGER PRIMARY KEY,
                   filename      TEXT NOT NULL,
                   filepath      TEXT NOT NULL,
                   hash          TEXT NOT NULL
                   )",
-        [],
-    )
-    .unwrap();
+            [],
+        )
+        .unwrap();
 }
 
-fn insert_file_record(record: FileRecord, remaining_retries: u8) {
-    let conn = Connection::open("filesystem_dupes.db").unwrap();
-    match conn.execute(
+async fn insert_file_record<'a>(
+    conn_lock: &'a Arc<RwLock<Connection>>,
+    record: FileRecord<'_>,
+) -> Result<(), &'a str> {
+    match conn_lock.write().unwrap().execute(
         "INSERT INTO file_record (filename, filepath, hash) VALUES (?1, ?2, ?3)",
         params![*record.filename, *record.filepath, *record.hash],
     ) {
         Ok(_) => {
             debug!("{} inserted into file_record table", record.filename);
+            return Ok(());
         }
         Err(err) => {
-            let err_msg =
-                format!("Error inserting file_record: {err}, retrying {remaining_retries} times");
-            error!("{}", err_msg);
-            if remaining_retries > 0 {
-                insert_file_record(record, remaining_retries - 1)
-            } else {
-                !panic(format!("Failed to insert {:?} into db", record).as_str())
-            }
+            let err_msg = format!("Error inserting file_record: {err}");
+            warn!("{}", err_msg);
+            return Err("Failed to insert into db");
         }
     }
 }
 
-async fn walk_filesystem_hashing(root: std::path::PathBuf) {
+async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLock<Connection>>) {
     info!("Walking {}", root.display());
     let files = WalkDir::new(root).same_file_system(true).max_open(100);
 
@@ -125,12 +135,12 @@ async fn walk_filesystem_hashing(root: std::path::PathBuf) {
                 continue;
             }
         };
-        handles.push(tokio::spawn(digest_and_insert_path(file)));
+        handles.push(digest_and_insert_path(file, &conn_lock));
     }
     futures::future::join_all(handles).await;
 }
 
-async fn digest_and_insert_path(file: DirEntry) {
+async fn digest_and_insert_path(file: DirEntry, conn_lock: &Arc<RwLock<Connection>>) {
     debug!("digest: {:?}", file);
     let path = file.into_path();
     if path.is_dir() {
@@ -143,7 +153,7 @@ async fn digest_and_insert_path(file: DirEntry) {
         filepath: &path.to_string_lossy().to_string(),
         hash: &String::from(digest.await.unwrap()),
     };
-    insert_file_record(record, 200)
+    insert_file_record(&conn_lock, record).await.unwrap()
 }
 
 async fn calculate_digest(file: &PathBuf) -> Option<String> {
