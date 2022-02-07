@@ -111,7 +111,6 @@ async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLoc
                     | path_string.contains("/target/")
                     | path_string.contains(".idea/")
                 {
-                    debug!("Skipping (.git, /target/) file.");
                     continue;
                 }
                 file
@@ -121,17 +120,18 @@ async fn walk_filesystem_hashing(root: std::path::PathBuf, conn_lock: &Arc<RwLoc
                 continue;
             }
         };
-        handles.push(digest_and_insert_path(file, &conn_lock));
+        info!("pushing future into handles");
+        let future = digest_and_insert_path(file, &conn_lock);
+        handles.push(future);
     }
     info!("Joining {} async handles", handles.len());
-    futures::future::join_all(handles).await;
+    futures::future::join_all(handles.into_iter()).await;
 }
 
 async fn digest_and_insert_path(file: DirEntry, conn_lock: &Arc<RwLock<Connection>>) {
     debug!("digest: {:?}", file);
     let path = file.into_path();
     if path.is_dir() {
-        debug!("Directory found: {}", path.to_str().unwrap());
         return;
     }
     let digest = calculate_digest(&path).await.unwrap();
